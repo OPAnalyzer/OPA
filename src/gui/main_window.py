@@ -3051,9 +3051,12 @@ class KeplerComparisonWidget(QWidget):
         axis.set_axis_off()
         axis.set_box_aspect((1.0, 1.0, 0.82))
         axis.view_init(elev=24.0, azim=-52.0)
-        axis.set_xlim(-1.55, 1.55)
-        axis.set_ylim(-1.55, 1.55)
-        axis.set_zlim(-1.25, 1.25)
+        # The orbit is normalised to radius 1, so a 1.55 half-span left it
+        # occupying barely a third of the panel.  1.30 fills the frame while
+        # still clearing the Omega/omega/nu callouts drawn at the rim.
+        axis.set_xlim(-1.30, 1.30)
+        axis.set_ylim(-1.30, 1.30)
+        axis.set_zlim(-1.05, 1.05)
 
         # Earth sphere.
         u = np.linspace(0.0, 2.0 * np.pi, 40)
@@ -3322,6 +3325,7 @@ class KeplerComparisonWidget(QWidget):
             fontsize=12,
         )
         figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95), pad=0.5)
+        figure.subplots_adjust(wspace=0.0)
         self.graph.draw_idle()
 
     def _calculate_trajectory_elements(self):
