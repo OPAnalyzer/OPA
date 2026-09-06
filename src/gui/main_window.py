@@ -88,6 +88,7 @@ from matplotlib import get_data_path as get_matplotlib_data_path
 from matplotlib import dates as mdates
 from matplotlib import ticker as mticker
 from matplotlib.colors import to_hex as matplotlib_to_hex
+from matplotlib import patheffects as mpatheffects
 from matplotlib.patches import Circle
 from matplotlib.path import Path as MplPath
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -9006,20 +9007,31 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
                     [],
                     [],
                     color=config["color"],
-                    linewidth=1.15,
+                    linewidth=1.5,
                     linestyle="--",
-                    alpha=0.28,
+                    alpha=0.36,
                     zorder=1,
                 )
                 orbit_front_artist, = axes.plot(
                     [],
                     [],
                     color=config["color"],
-                    linewidth=1.65,
+                    linewidth=2.4,
                     linestyle="-",
-                    alpha=0.92,
+                    alpha=1.0,
                     zorder=6.45,
                 )
+                # A wide, faint stroke under the near-side arc reads as the
+                # track glowing rather than as a thicker line, which keeps
+                # the orbit legible once the plot is scaled down.
+                orbit_front_artist.set_path_effects([
+                    mpatheffects.withStroke(
+                        linewidth=7.0,
+                        foreground=config["color"],
+                        alpha=0.16,
+                    ),
+                    mpatheffects.Normal(),
+                ])
                 link_artist, = axes.plot(
                     [],
                     [],
