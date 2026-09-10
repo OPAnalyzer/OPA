@@ -13,6 +13,7 @@ from admin_security import (
     AdminSessionManager,
     CONTENT_SCHEMA,
     WindowsDpapiProtector,
+    build_shared_access_package,
     build_signed_package,
     enroll_device,
 )
@@ -279,6 +280,66 @@ class AdminSecurityTests(unittest.TestCase):
         self.manager().unlock(self.package_path, self.password)
         files = {item.name for item in self.root.iterdir() if item.is_file()}
         self.assertEqual(files, {"enrollment.json", "demo.opa-admin"})
+
+    def test_shared_team_package_opens_for_second_enrolled_device(self):
+        shared_path = self.root / "team.opa-admin"
+        shared_path.write_bytes(
+            build_shared_access_package(
+                synthetic_content(),
+                self.password,
+                self.enrollment.verification_key,
+                self.signing_key,
+            )
+        )
+        second_path = self.root / "second-enrollment.json"
+        enroll_device(
+            self.enrollment.verification_key,
+            enrollment_path=second_path,
+            protector=MemoryProtector(b"device-b"),
+        )
+        second_manager = AdminSessionManager(
+            enrollment_path=second_path,
+            protector=MemoryProtector(b"device-b"),
+        )
+        content = second_manager.unlock(shared_path, self.password)
+        self.assertEqual(content.profiles[0].profile_id, "admin-synthetic-demo")
+        with self.assertRaisesRegex(AdminSecurityError, "unlock failed"):
+            self.manager().unlock(shared_path, secrets.token_urlsafe(24))
+
+    def test_shared_team_package_requires_its_signing_key_enrollment(self):
+        shared_path = self.root / "team.opa-admin"
+        shared_path.write_bytes(
+            build_shared_access_package(
+                synthetic_content(),
+                self.password,
+                self.enrollment.verification_key,
+                self.signing_key,
+            )
+        )
+        other_signing_key = Ed25519PrivateKey.generate()
+        wrong_key_path = self.root / "wrong-key-enrollment.json"
+        enroll_device(
+            other_signing_key.public_key().public_bytes(
+                Encoding.Raw, PublicFormat.Raw
+            ),
+            enrollment_path=wrong_key_path,
+            protector=MemoryProtector(b"device-c"),
+        )
+        manager = AdminSessionManager(
+            enrollment_path=wrong_key_path,
+            protector=MemoryProtector(b"device-c"),
+        )
+        with self.assertRaisesRegex(AdminSecurityError, "authorized"):
+            manager.unlock(shared_path, self.password)
+
+    def test_shared_team_package_rejects_mismatched_signing_key(self):
+        with self.assertRaisesRegex(AdminSecurityError, "does not match"):
+            build_shared_access_package(
+                synthetic_content(),
+                self.password,
+                self.enrollment.verification_key,
+                Ed25519PrivateKey.generate(),
+            )
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI is required")

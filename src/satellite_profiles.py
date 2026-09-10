@@ -17,6 +17,8 @@ from types import MappingProxyType
 from typing import Any, Mapping
 from uuid import uuid4
 
+from gordam import GordamImportError, load_gordam_solution
+
 import constants
 
 
@@ -466,6 +468,30 @@ def load_ephemeris_state_file(path: str | os.PathLike[str]) -> dict[str, Any]:
         "state_j2000": state,
         "reference_frame": "J2000",
         "source_description": description,
+    }
+
+
+def load_gordam_state_file(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Load one audited GORDAM OD state without inventing a nominal slot."""
+
+    try:
+        solution = load_gordam_solution(path)
+    except GordamImportError as error:
+        raise ProfileValidationError(str(error)) from error
+    provenance = (
+        f"GORDAM OD solution imported from {solution.source_name}; "
+        f"solution epoch {solution.epoch_utc.isoformat()}; "
+        f"reported longitude {solution.longitude_deg:.6f} deg E."
+    )
+    return {
+        "display_name": solution.satellite,
+        "epoch_utc": solution.epoch_utc.isoformat(),
+        "state_j2000": solution.state_j2000,
+        "reference_frame": "J2000",
+        "source_description": provenance,
+        "mass_kg": solution.mass_kg,
+        "target_longitude_deg": solution.longitude_deg,
+        "cp_scale_factor": solution.cp_scale_factor,
     }
 
 

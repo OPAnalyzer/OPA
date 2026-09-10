@@ -37,6 +37,7 @@ from satellite_profiles import (
     ProfileValidationError,
     SatelliteProfile,
     SatelliteProfileStore,
+    load_gordam_state_file,
     load_ephemeris_state_file,
     new_basic_profile_template,
     validate_profile,
@@ -118,6 +119,8 @@ class SatelliteProfileEditor(QDialog):
         )
         self.import_ephemeris_button = QPushButton("IMPORT EPHEMERIS STATE JSON")
         self.import_ephemeris_button.clicked.connect(self._import_ephemeris_state)
+        self.import_gordam_button = QPushButton("IMPORT GORDAM OD REPORT")
+        self.import_gordam_button.clicked.connect(self._import_gordam_state)
         state = profile.state_j2000 or ("",) * 6
         self.state_fields = [QLineEdit(_number_text(value)) for value in state]
         identity_form.addRow("Display name", self.display_name)
@@ -130,6 +133,7 @@ class SatelliteProfileEditor(QDialog):
         identity_form.addRow("Reference frame", self.reference_frame)
         identity_form.addRow("Source / provenance", self.source_description)
         identity_form.addRow("Ephemeris import", self.import_ephemeris_button)
+        identity_form.addRow("GORDAM import", self.import_gordam_button)
         for label, field in zip(("X [km]", "Y [km]", "Z [km]", "Vx [km/s]", "Vy [km/s]", "Vz [km/s]"), self.state_fields):
             identity_form.addRow(label, field)
         self.orbit_source.currentIndexChanged.connect(
@@ -397,6 +401,42 @@ class SatelliteProfileEditor(QDialog):
         self.epoch_utc.setText(imported["epoch_utc"])
         self.reference_frame.setCurrentIndex(0)
         self.source_description.setPlainText(imported["source_description"])
+        for field, value in zip(self.state_fields, imported["state_j2000"]):
+            field.setText(_number_text(value))
+
+    def _import_gordam_state(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            translate_for_widget(self, "Import GORDAM orbit-determination report"),
+            "",
+            "GORDAM detailed report (*.stdout *.txt);;All Files (*)",
+            options=theme.file_dialog_options(),
+        )
+        if not path:
+            return
+        try:
+            imported = load_gordam_state_file(path)
+        except (OSError, ProfileValidationError, ValueError) as error:
+            show_localized_message(
+                self,
+                QMessageBox.Icon.Warning,
+                "GORDAM import failed",
+                str(error),
+            )
+            return
+        self.orbit_source.setCurrentIndex(self.orbit_source.findData("ephemeris"))
+        self.display_name.setText(imported["display_name"])
+        self.epoch_utc.setText(imported["epoch_utc"])
+        self.reference_frame.setCurrentIndex(0)
+        self.source_description.setPlainText(imported["source_description"])
+        self.target_longitude.setText(_number_text(imported["target_longitude_deg"]))
+        if imported["mass_kg"] is not None:
+            self.mass.setText(_number_text(imported["mass_kg"]))
+        cp_scale = imported["cp_scale_factor"]
+        if cp_scale is not None:
+            note = "GORDAM CP scale factor: " + _number_text(cp_scale)
+            existing = self.notes.toPlainText().strip()
+            self.notes.setPlainText(f"{existing}\n{note}".strip())
         for field, value in zip(self.state_fields, imported["state_j2000"]):
             field.setText(_number_text(value))
 

@@ -1,5 +1,84 @@
 # Changelog
 
+## 2.54.0
+
+- Set the protected Sun-outage link preset to 10.7 GHz and 2.0 m, with an
+  explicit checkbox required before operators can edit either physical input.
+- Evaluate TLE spacecraft positions with SGP4 at Sun-transit search and contact
+  epochs while propagation remains inside the profile's physical station box;
+  preserve source-derived station-kept GEO motion if long-arc TLE drift leaves
+  that configured control region.
+- Warn when a prediction season is far from the active TLE epoch and recommend
+  historical event-date orbit data; reference schedule times still never feed
+  back into propagation or boundary detection.
+
+## 2.53.0
+
+- Use the active spacecraft's audited J2000 state to carry its measured
+  inclination, eccentricity and orbital phase into Sun-outage geometry.
+- Constrain isolated-state extrapolation to the physical sidereal rate instead
+  of free-drifting it across a season; keep the fixed nominal GEO slot only as
+  an explicitly labelled fallback when no valid state exists.
+- Export the spacecraft-geometry mode with each Sun-outage schedule so a state-
+  derived result cannot be confused with a fixed-slot calculation.
+- Preserve the operator schedules as comparison-only observations. No timing
+  offset, beamwidth constant or reference-derived calibration is applied.
+
+## 2.52.0
+
+- Separate Sun-outage centre timing from contact-window duration by comparing
+  the model peak with the immutable reference-window midpoint.
+- Show signed per-event duration differences as percentages and a duration
+  MAPE summary without fitting any model constant.
+- Mark boundary and duration comparisons as non-like-for-like when the source
+  schedule omits frequency, antenna diameter, beamwidth, link margin and event
+  threshold, preventing those configuration differences from being presented
+  as calibrated model accuracy.
+
+## 2.51.0
+
+- Bundle the supplied 2026 AZ1/AZ2 operator Sun-outage schedules and load them
+  automatically, so error metrics no longer depend on a manual import step.
+- Match the application names `Azerspace-1` and `Azerspace-2 (IS-38)` to their
+  AZ1/AZ2 reference records while keeping each original source timestamp.
+
+## 2.50.0
+
+- Added matched-event Sun-outage error metrics from imported operator TXT/XLSX
+  references: start, end and duration MAE/bias plus the maximum contact-boundary
+  error, shown in both seconds and minutes.
+- Added per-event reference/model durations and signed `model − reference`
+  timing errors without modifying or calibrating the model from the reference.
+- Display the spacecraft attached to every reference and label a schedule whose
+  identity is inherited from an explicitly identified companion source.
+
+## 2.47.1
+
+- Ignore a queued Matplotlib redraw after its Qt graph widget has closed.
+
+## 2.47.0
+
+- Added signed shared admin packages for authorized team computers already
+  enrolled with the same verification key. The package still requires its
+  password and the signing private key remains outside the application.
+
+## 2.46.3
+
+- Resolve Sun-outage longitude from the selected spacecraft's reference or
+  state epoch instead of a shared station-keeping default. Display provenance
+  and reject unavailable or ambiguous slots.
+
+## 2.46.2
+
+- Restore Admin Access and Credits to the bottom of the Settings navigation.
+
+## 2.46.1
+
+- Reject below-horizon GEO slots and explicitly empty Sun-transit searches.
+- Invalidate Sun-outage results when inputs or session profiles change, and
+  discard late results after logout or cancellation.
+- Keep numerical precision fields readable in the Azerbaijani Settings page.
+
 ## 2.46.0
 
 - Added an Eclipse-module `SUN OUTAGE` workspace using ITU-R S.1525-1

@@ -358,8 +358,16 @@ from orbit_determination import (
 from sun_outage import (
     SunOutageCancelled,
     SunOutageStation,
+    profile_reference_longitude,
     predict_sun_outages,
     save_sun_outage_csv,
+)
+from sun_outage_reference import (
+    SunOutageReferenceError,
+    calculate_sun_outage_error_metrics,
+    load_bundled_sun_outage_references,
+    load_sun_outage_reference_files,
+    sun_outage_satellite_code,
 )
 from constants import MU_EARTH
 from earth_orientation import (
@@ -1565,6 +1573,7 @@ class SettingsOverlay(QWidget):
         self.program_nav_button.setChecked(True)
         self.program_nav_button.setMinimumHeight(52)
         navigation_layout.addWidget(self.program_nav_button)
+        navigation_layout.addStretch(1)
         self.admin_nav_button = QPushButton("ADMIN ACCESS")
         self.admin_nav_button.setObjectName("settingsNavButton")
         self.admin_nav_button.setCheckable(True)
@@ -1575,10 +1584,6 @@ class SettingsOverlay(QWidget):
         self.credits_nav_button.setCheckable(True)
         self.credits_nav_button.setMinimumHeight(42)
         navigation_layout.addWidget(self.credits_nav_button)
-        # The three destinations read as one contiguous group; the free
-        # space belongs below them, not wedged between the first and the
-        # second entry.
-        navigation_layout.addStretch(1)
         body_layout.addWidget(navigation)
 
         self.pages = QStackedWidget()
@@ -1741,15 +1746,16 @@ class SettingsOverlay(QWidget):
         self.settings_max_step.setRange(1, 3600)
         precision_layout.addWidget(QLabel("Relative tol."), 1, 0)
         precision_layout.addWidget(self.settings_rtol, 1, 1)
-        precision_layout.addWidget(QLabel("Absolute tol."), 1, 2)
-        precision_layout.addWidget(self.settings_atol, 1, 3)
-        precision_layout.addWidget(QLabel("Maximum step [s]"), 2, 0)
-        precision_layout.addWidget(self.settings_max_step, 2, 1)
+        precision_layout.addWidget(QLabel("Absolute tol."), 2, 0)
+        precision_layout.addWidget(self.settings_atol, 2, 1)
+        precision_layout.addWidget(QLabel("Maximum step [s]"), 3, 0)
+        precision_layout.addWidget(self.settings_max_step, 3, 1)
         self.settings_eop = QCheckBox("IERS EOP correction")
         self.settings_eop.setToolTip(
             "Use bundled UT1−UTC and polar-motion Earth orientation data."
         )
-        precision_layout.addWidget(self.settings_eop, 2, 2, 1, 2)
+        precision_layout.addWidget(self.settings_eop, 4, 0, 1, 2)
+        precision_layout.setColumnStretch(1, 1)
         layout.addWidget(precision_card)
 
         footer = QHBoxLayout()
@@ -2606,8 +2612,13 @@ class GraphWidget(ClickActivatedFigureCanvas):
         return self
 
     def draw(self, *args, **kwargs):
-        self.apply_theme()
-        return super().draw(*args, **kwargs)
+        try:
+            self.apply_theme()
+            return super().draw(*args, **kwargs)
+        except RuntimeError as error:
+            if "has been deleted" in str(error):
+                return None
+            raise
 
     @staticmethod
     def style_axis(axis):
@@ -3756,6 +3767,7 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         self.system_view_pitch = 25.0
         self.system_view_zoom = 1.0
         self._orbital_theater_mode = False
+        self._orbital_theater_restore = None
         self._graph_only_mode = False
         self._graph_fullscreen_restore = None
         self._window_restore_maximized = False
@@ -3897,6 +3909,12 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
             and event.type() == QEvent.Type.Resize
         ):
             QTimer.singleShot(0, self.position_graph_fullscreen_button)
+
+        if (
+            watched is getattr(self, "system_graph", None)
+            and event.type() == QEvent.Type.Resize
+        ):
+            QTimer.singleShot(0, self.position_system_theater_button)
 
         if event.type() == QEvent.Type.MouseButtonPress:
             clicked_canvas = None
@@ -4250,7 +4268,7 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
 
         self.retro_view_menu = menu_bar.addMenu("View")
         for label in (
-            "LIVE TELEMETRY",
+            "LIVE COORDINATES",
             "PERTURBATION",
             "ORBITAL VIEW",
             "REFERENCE LAB",
@@ -4811,6 +4829,7 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
     def logout_admin_session(self):
         """Remove private session UI/data and return to the public profile."""
 
+        self.invalidate_sun_outage_result()
         manager = getattr(self, "admin_session", None)
         if manager is None:
             return
@@ -5419,7 +5438,7 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
 
         self.tabs.addTab(
             page,
-            "LIVE TELEMETRY"
+            "LIVE COORDINATES"
         )
 
 
@@ -5674,9 +5693,12 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         )
         system_content = QWidget()
         layout = QVBoxLayout(system_content)
+        self.system_view_layout = layout
         layout.setContentsMargins(12, 10, 12, 16)
 
-        controls = QHBoxLayout()
+        self.system_controls_host = QWidget()
+        controls = QHBoxLayout(self.system_controls_host)
+        controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(10)
 
         self.sync_active_profile_orbital_object()
@@ -5797,9 +5819,6 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         self.system_fullscreen_button.clicked.connect(
             self.toggle_full_screen
         )
-        controls.addWidget(
-            self.system_fullscreen_button
-        )
 
         controls.addStretch()
 
@@ -5807,13 +5826,7 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
             "LIVE - waiting for coordinates"
         )
         _set_status_role(self.system_live_status, "info")
-        layout.addLayout(
-            controls
-        )
-        live_status_row = QHBoxLayout()
-        live_status_row.addStretch(1)
-        live_status_row.addWidget(self.system_live_status)
-        layout.addLayout(live_status_row)
+        layout.addWidget(self.system_controls_host)
 
         object_box = QGroupBox(
             "VISIBLE OBJECTS — TLE / GCRS J2000"
@@ -5821,7 +5834,6 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         self.system_object_box = object_box
         object_box_layout = QVBoxLayout(object_box)
         object_layout = QHBoxLayout()
-        object_actions_layout = QHBoxLayout()
         object_box_layout.addLayout(object_layout)
         object_layout.setContentsMargins(
             10,
@@ -5871,29 +5883,6 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
 
         object_layout.addStretch()
 
-        self.system_theater_button = QPushButton(
-            "EXPAND ORBIT"
-        )
-        self.system_theater_button.setToolTip(
-            "Hide the header and telemetry cards to enlarge the orbit canvas."
-        )
-        self.system_theater_button.clicked.connect(
-            self.toggle_orbital_theater_mode
-        )
-        object_action_target = object_actions_layout
-        object_action_target.addStretch(1)
-        object_action_target.addWidget(
-            self.system_theater_button
-        )
-
-        self.system_precision_badge = QLabel(
-            "1:1 AXES  •  REAL DISTANCES"
-        )
-        _set_status_role(self.system_precision_badge, "ok")
-        object_action_target.addWidget(
-            self.system_precision_badge
-        )
-        object_box_layout.addLayout(object_actions_layout)
         layout.addWidget(
             object_box
         )
@@ -5927,21 +5916,22 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
             stretch=1,
         )
 
-        self.system_interaction_hint = QLabel(
-            "Click graph: enable wheel zoom  •  Click outside: page scroll  •  "
-            "Double-click: deep focus zoom  •  3D: drag orbit camera  •  "
-            "Crosshair: focused-frame horizontal / vertical coordinates"
+        self.system_theater_button = QPushButton(
+            "EXPAND ORBIT",
+            self.system_graph,
         )
-        self.system_interaction_hint.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
+        self.system_theater_button.setObjectName("graphOverlayAction")
+        self.system_theater_button.setToolTip(
+            "Show only the orbit graph in full screen."
         )
-        self.system_interaction_hint.setObjectName("metricDetail")
-        layout.addWidget(
-            self.system_interaction_hint
+        self.system_theater_button.clicked.connect(
+            self.toggle_orbital_theater_mode
         )
+        self.system_theater_button.adjustSize()
+        QTimer.singleShot(0, self.position_system_theater_button)
 
         coordinates_box = QGroupBox(
-            "LIVE TELEMETRY — ABSOLUTE GCRS J2000 [km]"
+            "LIVE COORDINATES — ABSOLUTE GCRS J2000 [km]"
         )
         self.system_coordinates_box = coordinates_box
         coordinates_box.setMaximumHeight(
@@ -6116,6 +6106,21 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         button.raise_()
 
 
+    def position_system_theater_button(self):
+
+        button = getattr(self, "system_theater_button", None)
+        graph = getattr(self, "system_graph", None)
+        if button is None or graph is None:
+            return
+        button.adjustSize()
+        margin = 10
+        button.move(
+            max(margin, graph.width() - button.width() - margin),
+            margin,
+        )
+        button.raise_()
+
+
     def refresh_graph_layout_after_view_change(self):
 
         graph = getattr(self, "graph", None)
@@ -6201,32 +6206,86 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
 
     def toggle_orbital_theater_mode(self):
 
-        self._orbital_theater_mode = not self._orbital_theater_mode
-        regular_view = not self._orbital_theater_mode
-        self.hero_card.setVisible(
-            regular_view
-        )
-        self.tabs.tabBar().setVisible(
-            regular_view
-        )
-        self.module_tabs.tabBar().setVisible(
-            regular_view
-        )
-        self.system_coordinates_box.setVisible(
-            regular_view
-        )
-        self.system_interaction_hint.setVisible(
-            regular_view
-        )
-        self.system_theater_button.setText(
-            "EXIT EXPANDED"
-            if self._orbital_theater_mode
-            else "EXPAND ORBIT"
-        )
+        if self._orbital_theater_mode:
+            restore = self._orbital_theater_restore or {}
+            self._orbital_theater_mode = False
+            for widget, was_visible in restore.get("widgets", ()):
+                widget.setVisible(was_visible)
+            self.main_layout.setContentsMargins(
+                *restore.get("main_margins", (18, 14, 18, 18))
+            )
+            self.main_layout.setSpacing(restore.get("main_spacing", 14))
+            self.system_view_layout.setContentsMargins(
+                *restore.get("view_margins", (12, 10, 12, 16))
+            )
+            self.system_view_layout.setSpacing(
+                restore.get("view_spacing", 6)
+            )
+            self.system_view_scroll.setVerticalScrollBarPolicy(
+                restore.get(
+                    "vertical_scroll_policy",
+                    Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+                )
+            )
+            if restore.get("was_fullscreen", False):
+                self.showFullScreen()
+            elif restore.get("was_maximized", False):
+                self.showMaximized()
+            else:
+                self.showNormal()
+            self.system_theater_button.setText(self.tr("EXPAND ORBIT"))
+            self.system_theater_button.setToolTip(
+                self.tr("Show only the orbit graph in full screen.")
+            )
+            self._orbital_theater_restore = None
+        else:
+            widgets = (
+                self.menuBar(),
+                self.hero_card,
+                self.product_command_bar,
+                self.module_tabs.tabBar(),
+                self.tabs.tabBar(),
+                self.system_controls_host,
+                self.system_object_box,
+                self.system_coordinates_box,
+                self.statusBar(),
+            )
+            self._orbital_theater_restore = {
+                "widgets": tuple(
+                    (widget, widget.isVisible()) for widget in widgets
+                ),
+                "main_margins": self.main_layout.getContentsMargins(),
+                "main_spacing": self.main_layout.spacing(),
+                "view_margins": self.system_view_layout.getContentsMargins(),
+                "view_spacing": self.system_view_layout.spacing(),
+                "vertical_scroll_policy": (
+                    self.system_view_scroll.verticalScrollBarPolicy()
+                ),
+                "was_fullscreen": self.isFullScreen(),
+                "was_maximized": self.isMaximized(),
+            }
+            self._orbital_theater_mode = True
+            for widget in widgets:
+                widget.hide()
+            self.main_layout.setContentsMargins(0, 0, 0, 0)
+            self.main_layout.setSpacing(0)
+            self.system_view_layout.setContentsMargins(0, 0, 0, 0)
+            self.system_view_layout.setSpacing(0)
+            self.system_view_scroll.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self.system_theater_button.setText(self.tr("EXIT  [ESC]"))
+            self.system_theater_button.setToolTip(
+                self.tr("Return to the complete application.")
+            )
+            self.showFullScreen()
+
+        self.system_theater_button.adjustSize()
         QTimer.singleShot(
             0,
             self.safe_update_system_view,
         )
+        QTimer.singleShot(0, self.position_system_theater_button)
 
 
     def keyPressEvent(self, event):
@@ -9659,12 +9718,6 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
             f"{2.0 * vertical_limit:,.0f} km\n"
             f"Off-screen (true position): {offscreen_text}"
         )
-        self.system_precision_badge.setText(
-            f"WGS-84 ALT  •  1:1 AXES  •  H ±{horizontal_limit:,.0f} / "
-            f"V ±{vertical_limit:,.0f} km  •  "
-            f"ZOOM {1.0 / self.system_view_zoom:.2f}×"
-        )
-
         status_parts = [
             "LIVE",
             epoch.astimezone(
@@ -12531,13 +12584,25 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         self.sun_outage_frequency = QDoubleSpinBox()
         self.sun_outage_frequency.setRange(0.1, 100.0)
         self.sun_outage_frequency.setDecimals(3)
-        self.sun_outage_frequency.setValue(11.0)
+        self.sun_outage_frequency.setValue(10.7)
         self.sun_outage_frequency.setSuffix(" GHz")
         self.sun_outage_antenna_diameter = QDoubleSpinBox()
         self.sun_outage_antenna_diameter.setRange(0.1, 100.0)
         self.sun_outage_antenna_diameter.setDecimals(3)
-        self.sun_outage_antenna_diameter.setValue(3.7)
+        self.sun_outage_antenna_diameter.setValue(2.0)
         self.sun_outage_antenna_diameter.setSuffix(" m")
+        self.sun_outage_edit_link_parameters = QCheckBox(
+            "EDIT FREQUENCY / ANTENNA DIAMETER"
+        )
+        self.sun_outage_edit_link_parameters.setChecked(False)
+        self.sun_outage_edit_link_parameters.toggled.connect(
+            self.set_sun_outage_link_inputs_unlocked
+        )
+        self.sun_outage_frequency.setEnabled(False)
+        self.sun_outage_antenna_diameter.setEnabled(False)
+        for field in (self.sun_outage_year, self.sun_outage_frequency,
+                      self.sun_outage_antenna_diameter):
+            field.valueChanged.connect(self.invalidate_sun_outage_result)
         self.sun_outage_satellite_longitude = QDoubleSpinBox()
         self.sun_outage_satellite_longitude.setRange(-180.0, 180.0)
         self.sun_outage_satellite_longitude.setDecimals(6)
@@ -12557,19 +12622,25 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         inputs.addWidget(self.sun_outage_antenna_diameter, 1, 3)
         inputs.addWidget(QLabel("Active GEO slot:"), 1, 4)
         inputs.addWidget(self.sun_outage_satellite_longitude, 1, 5)
+        inputs.addWidget(self.sun_outage_edit_link_parameters, 2, 0, 1, 3)
+        self.sun_outage_slot_source = QLabel()
+        self.sun_outage_slot_source.setWordWrap(True)
+        self.sun_outage_slot_source.setObjectName("metricDetail")
+        inputs.addWidget(self.sun_outage_slot_source, 5, 0, 1, 6)
 
         self.sun_outage_station_summary = QLabel()
         self.sun_outage_station_summary.setWordWrap(True)
         self.sun_outage_station_summary.setObjectName("metricDetail")
-        inputs.addWidget(self.sun_outage_station_summary, 2, 0, 1, 6)
+        inputs.addWidget(self.sun_outage_station_summary, 3, 0, 1, 6)
         link_note = QLabel(
-            "Frequency and antenna diameter must match the receiving link. "
+            "Default engineering preset: 10.7 GHz / 2.0 m (ITU 70 λ/D beam). "
+            "Unlock only when the receiving link's actual values are known. "
             "The result is the Sun-disc + 3 dB beam intersection window; an "
             "actual carrier outage also depends on link margin and solar flux."
         )
         link_note.setWordWrap(True)
         _set_status_role(link_note, "warning")
-        inputs.addWidget(link_note, 3, 0, 1, 6)
+        inputs.addWidget(link_note, 4, 0, 1, 6)
         layout.addWidget(inputs_box)
 
         actions = QHBoxLayout()
@@ -12587,9 +12658,14 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         self.sun_outage_export_button = QPushButton("EXPORT SUN OUTAGE CSV")
         self.sun_outage_export_button.setEnabled(False)
         self.sun_outage_export_button.clicked.connect(self.export_sun_outage_csv)
+        self.sun_outage_reference_button = QPushButton("IMPORT REFERENCE SCHEDULE")
+        self.sun_outage_reference_button.clicked.connect(
+            self.import_sun_outage_reference
+        )
         actions.addWidget(self.sun_outage_calculate_button)
         actions.addWidget(self.sun_outage_cancel_button)
         actions.addWidget(self.sun_outage_export_button)
+        actions.addWidget(self.sun_outage_reference_button)
         actions.addStretch(1)
         layout.addLayout(actions)
 
@@ -12635,9 +12711,104 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         self.sun_outage_table.setMinimumHeight(300)
         results.addWidget(self.sun_outage_table)
 
+        reference_box = QGroupBox("REFERENCE SCHEDULE COMPARISON")
+        reference_layout = QVBoxLayout(reference_box)
+        self.sun_outage_reference_events = ()
+        self.sun_outage_reference_files = ()
+        self.sun_outage_reference_summary = QLabel(
+            "Import the operator TXT/XLSX schedule to compare source events with the model."
+        )
+        self.sun_outage_reference_summary.setWordWrap(True)
+        self.sun_outage_reference_summary.setObjectName("metricDetail")
+        reference_layout.addWidget(self.sun_outage_reference_summary)
+
+        error_box = QGroupBox("COMPARISON METRICS — MATCHED EVENTS ONLY")
+        error_layout = QGridLayout(error_box)
+        error_layout.setContentsMargins(12, 22, 12, 12)
+        error_layout.setHorizontalSpacing(10)
+        error_layout.setVerticalSpacing(10)
+        self.sun_outage_error_labels = {}
+        error_specs = (
+            (
+                "center_mae_seconds",
+                "CENTER MAE",
+                "Reference midpoint vs geometric peak",
+            ),
+            (
+                "center_bias_seconds",
+                "CENTER BIAS",
+                "Signed peak − reference midpoint",
+            ),
+            (
+                "duration_mape_percent",
+                "DURATION MAPE",
+                "Mean absolute schedule-duration difference",
+            ),
+            ("matched_count", "MATCHED EVENTS", "Included in these metrics"),
+            ("start_mae_seconds", "START MAE", "Mean absolute start-time error"),
+            ("end_mae_seconds", "END MAE", "Mean absolute end-time error"),
+            ("duration_mae_seconds", "DURATION MAE", "Mean absolute window-length error"),
+            (
+                "maximum_boundary_error_seconds",
+                "MAX |START / END|",
+                "Largest contact-boundary error",
+            ),
+        )
+        roles = ("blue", "sage", "lavender", "blush", "sand", "blue", "sage", "lavender")
+        for index, (key, caption, detail) in enumerate(error_specs):
+            card = QFrame()
+            card.setObjectName("metricCard")
+            card.setProperty("surfaceRole", roles[index])
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 10, 12, 10)
+            card_layout.setSpacing(3)
+            caption_label = QLabel(caption)
+            caption_label.setObjectName("metricCaption")
+            value_label = QLabel("—")
+            value_label.setObjectName("geoMetricValue")
+            value_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            detail_label = QLabel(detail)
+            detail_label.setObjectName("metricDetail")
+            detail_label.setWordWrap(True)
+            card_layout.addWidget(caption_label)
+            card_layout.addWidget(value_label)
+            card_layout.addWidget(detail_label)
+            self.sun_outage_error_labels[key] = value_label
+            error_layout.addWidget(card, index // 4, index % 4)
+            error_layout.setColumnStretch(index % 4, 1)
+        reference_layout.addWidget(error_box)
+
+        self.sun_outage_reference_table = QTableWidget(0, 16)
+        self.sun_outage_reference_table.setHorizontalHeaderLabels(
+            (
+                "Date UTC", "Satellite", "Reference start", "Reference midpoint",
+                "Reference end", "Reference duration", "Model start", "Model peak",
+                "Model end", "Model duration", "Center difference",
+                "Start difference", "End difference", "Duration difference",
+                "Duration difference %", "Status",
+            )
+        )
+        self.sun_outage_reference_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.sun_outage_reference_table.verticalHeader().setVisible(False)
+        reference_header = self.sun_outage_reference_table.horizontalHeader()
+        for column in range(16):
+            reference_header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.sun_outage_reference_table.setMinimumHeight(240)
+        reference_layout.addWidget(self.sun_outage_reference_table)
+        results.addWidget(reference_box)
+
         provenance = QLabel(
             "Method: ITU-R S.1525-1 Annex 2 beam geometry, WGS-84 Earth "
-            "station, fixed nominal GSO slot and JPL DE440 apparent Sun. "
+            "station and JPL DE440 apparent Sun. A valid active J2000 state "
+            "supplies the spacecraft's inclination, eccentricity and orbital "
+            "phase at the station-kept sidereal rate; the fixed nominal GSO "
+            "slot is used only as a labelled fallback. "
             "No eclipse or propagation result is modified."
         )
         provenance.setWordWrap(True)
@@ -12650,10 +12821,12 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         outer.addWidget(scroll)
         self.refresh_sun_outage_stations()
         self.refresh_sun_outage_profile()
+        self.load_default_sun_outage_references()
         return page
 
 
     def refresh_sun_outage_stations(self):
+        self.invalidate_sun_outage_result()
         selector = getattr(self, "sun_outage_station_combo", None)
         if selector is None:
             return
@@ -12670,19 +12843,51 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         selector.setCurrentIndex(index if index >= 0 else 0)
         selector.blockSignals(False)
         self.update_sun_outage_station_summary()
+        self.refresh_sun_outage_profile()
 
 
     def refresh_sun_outage_profile(self):
+        self.invalidate_sun_outage_result()
         control = getattr(self, "sun_outage_satellite_longitude", None)
         if control is None:
             return
-        control.setValue(float(self.active_profile.target_longitude_deg))
-        control.setToolTip(
-            f"{self.active_profile.display_name} nominal Earth-fixed GEO slot."
-        )
+        self._sun_outage_slot_valid = False
+        try:
+            longitude = profile_reference_longitude(
+                self.active_profile, available_eclipse_reference_specs()
+            )
+            if longitude is not None:
+                source = self.tr("Nominal slot from spacecraft reference")
+            elif self.active_profile.is_demo_geo_baseline:
+                longitude = float(self.active_profile.target_longitude_deg)
+                source = self.tr("Synthetic nominal GEO slot")
+            else:
+                state, epoch = self.active_spacecraft_state(self.get_analysis_utc())
+                state = np.asarray(state, dtype=float)
+                if state.shape != (6,) or not np.all(np.isfinite(state)):
+                    raise ValueError("Invalid state")
+                elements = cartesian_to_keplerian(state)
+                if not 35000 <= float(elements["a_km"]) <= 50000:
+                    raise ValueError("A GEO spacecraft state is required")
+                terrestrial = j2000_to_itrs_rotation_from_datetime(epoch) @ state[:3]
+                longitude = float(np.degrees(np.arctan2(terrestrial[1], terrestrial[0])))
+                source = self.tr("Fixed-slot estimate from state epoch") + " · " + epoch.isoformat()
+            control.setSpecialValueText("")
+            control.setValue(longitude)
+            control.setEnabled(True)
+            control.setToolTip(source)
+            self.sun_outage_slot_source.setText(source)
+            self._sun_outage_slot_valid = True
+        except Exception:
+            control.setValue(control.minimum())
+            control.setSpecialValueText("—")
+            control.setEnabled(False)
+            control.setToolTip("")
+            self.sun_outage_slot_source.setText(self.tr("GEO longitude unavailable; check the spacecraft state or reference."))
 
 
     def update_sun_outage_station_summary(self, _index=None):
+        self.invalidate_sun_outage_result()
         label = getattr(self, "sun_outage_station_summary", None)
         selector = getattr(self, "sun_outage_station_combo", None)
         if label is None or selector is None:
@@ -12701,8 +12906,35 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         )
 
 
+    def invalidate_sun_outage_result(self, *_args):
+        self._sun_outage_accept_result = False
+        self.sun_outage_prediction = None
+        thread = getattr(self, "sun_outage_thread", None)
+        if thread is not None and thread.isRunning():
+            thread.requestInterruption()
+        if hasattr(self, "sun_outage_table"):
+            self.sun_outage_table.setRowCount(0)
+            self.sun_outage_export_button.setEnabled(False)
+            self.sun_outage_summary.setText(
+                "Choose the receiving link parameters and calculate the yearly schedule."
+            )
+        if hasattr(self, "sun_outage_reference_table"):
+            self.update_sun_outage_reference_comparison()
+
+    def set_sun_outage_link_inputs_unlocked(self, unlocked):
+        """Keep the physical link preset protected from accidental edits."""
+
+        enabled = bool(unlocked)
+        self.sun_outage_frequency.setEnabled(enabled)
+        self.sun_outage_antenna_diameter.setEnabled(enabled)
+        self.invalidate_sun_outage_result()
+
     def run_sun_outage_prediction(self):
-        if self.sun_outage_thread is not None and self.sun_outage_thread.isRunning():
+        if self.sun_outage_thread is not None:
+            return
+        self.refresh_sun_outage_profile()
+        if not self._sun_outage_slot_valid:
+            self.sun_outage_summary.setText(self.sun_outage_slot_source.text())
             return
         if self.eclipse_thread is not None and self.eclipse_thread.isRunning():
             self.sun_outage_summary.setText(
@@ -12735,6 +12967,63 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
             ),
             "eop_enabled": is_eop_enabled(),
         }
+        self._sun_outage_model_warning = None
+        if self.active_profile.orbit_source == "tle":
+            try:
+                parameters["satellite_tle_name"] = (
+                    self.active_profile.tle_name or None
+                )
+                parameters["satellite_norad_id"] = self.active_profile.norad_id
+                parameters["satellite_station_box_half_width_deg"] = float(
+                    self.active_profile.station_box_half_width_deg
+                )
+                metadata = get_tle_metadata(
+                    self.active_profile.tle_name or None,
+                    norad_id=self.active_profile.norad_id,
+                )
+                tle_epoch = metadata["tle_epoch"]
+                season_epochs = (
+                    datetime(parameters["year"], 3, 20, tzinfo=timezone.utc),
+                    datetime(parameters["year"], 9, 22, tzinfo=timezone.utc),
+                )
+                season_age_days = tuple(
+                    abs((epoch - tle_epoch).total_seconds()) / 86400.0
+                    for epoch in season_epochs
+                )
+                self._sun_outage_model_warning = (
+                    f"Active TLE epoch is {tle_epoch.isoformat()}; March/September "
+                    f"season distances are {season_age_days[0]:.0f}/"
+                    f"{season_age_days[1]:.0f} days. Use historical event-date "
+                    "TLE/ephemeris for validation-grade contact times."
+                )
+            except Exception as error:
+                parameters.pop("satellite_tle_name", None)
+                parameters.pop("satellite_norad_id", None)
+                parameters.pop("satellite_station_box_half_width_deg", None)
+                self._sun_outage_model_warning = (
+                    "Event-time TLE propagation unavailable; " + str(error)
+                )
+        else:
+            try:
+                state, state_epoch = self.active_spacecraft_state(
+                    self.get_analysis_utc()
+                )
+                state = np.asarray(state, dtype=float)
+                if state.shape != (6,) or not np.all(np.isfinite(state)):
+                    raise ValueError("active state is not a finite six-vector")
+                elements = cartesian_to_keplerian(state)
+                if not 35_000.0 <= float(elements["a_km"]) <= 50_000.0:
+                    raise ValueError("active state is outside the GEO range")
+                if state_epoch is None or state_epoch.tzinfo is None:
+                    raise ValueError("active state has no timezone-aware epoch")
+                parameters["satellite_state_j2000"] = tuple(
+                    float(value) for value in state
+                )
+                parameters["satellite_state_epoch_utc"] = state_epoch
+            except Exception as error:
+                self._sun_outage_model_warning = (
+                    "State-derived orbit unavailable; " + str(error)
+                )
         self.sun_outage_prediction = None
         self.sun_outage_table.setRowCount(0)
         self.sun_outage_export_button.setEnabled(False)
@@ -12746,9 +13035,20 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
             "SUN OUTAGE SEARCH RUNNING\n"
             f"Station: {station.name} · Spacecraft: "
             f"{self.active_profile.display_name} · "
-            f"slot {parameters['satellite_longitude_deg']:+.6f}°E"
+            f"slot {parameters['satellite_longitude_deg']:+.6f}°E · "
+            + (
+                "event-time SGP4 from active TLE"
+                if "satellite_tle_name" in parameters
+                or "satellite_norad_id" in parameters
+                else (
+                    "state-derived periodic GEO"
+                    if "satellite_state_j2000" in parameters
+                    else "fixed-slot fallback"
+                )
+            )
         )
 
+        self._sun_outage_accept_result = True
         self.sun_outage_thread = QThread(self)
         self.sun_outage_worker = SunOutageWorker(parameters)
         self.sun_outage_worker.moveToThread(self.sun_outage_thread)
@@ -12779,7 +13079,46 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         return value.astimezone(timezone.utc).strftime("%H:%M:%S")
 
 
+    @staticmethod
+    def _sun_outage_error_text(value, *, signed=False):
+        if value is None:
+            return "—"
+        seconds = f"{value:+.1f}" if signed else f"{value:.1f}"
+        minutes = f"{value / 60.0:+.2f}" if signed else f"{value / 60.0:.2f}"
+        return f"{seconds} s  ·  {minutes} min"
+
+
+    def set_sun_outage_error_metrics(self, metrics=None, *, awaiting_model=False):
+        labels = getattr(self, "sun_outage_error_labels", {})
+        if not labels:
+            return
+        if metrics is None or not metrics.matched_count:
+            empty_text = "CALCULATE FIRST" if awaiting_model else "—"
+            for label in labels.values():
+                label.setText(empty_text)
+            return
+        for key in (
+            "center_mae_seconds",
+            "start_mae_seconds",
+            "end_mae_seconds",
+            "duration_mae_seconds",
+            "maximum_boundary_error_seconds",
+        ):
+            labels[key].setText(
+                self._sun_outage_error_text(getattr(metrics, key))
+            )
+        labels["center_bias_seconds"].setText(
+            self._sun_outage_error_text(metrics.center_bias_seconds, signed=True)
+        )
+        labels["duration_mape_percent"].setText(
+            f"{metrics.duration_mape_percent:.1f} %"
+        )
+        labels["matched_count"].setText(str(metrics.matched_count))
+
+
     def finish_sun_outage_prediction(self, prediction):
+        if not getattr(self, "_sun_outage_accept_result", False):
+            return
         self.sun_outage_prediction = prediction
         self.sun_outage_table.setRowCount(len(prediction.events))
         baku_offset = timezone(timedelta(hours=4))
@@ -12798,6 +13137,7 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
                 item = QTableWidgetItem(value)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.sun_outage_table.setItem(row, column, item)
+        self.update_sun_outage_reference_comparison()
         self.sun_outage_progress.setValue(100)
         self.sun_outage_progress.setFormat("Completed")
         self.sun_outage_calculate_button.setEnabled(True)
@@ -12813,6 +13153,7 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
                 f"{prediction.station.name} and "
                 f"{self.active_profile.display_name} "
                 f"({prediction.satellite_longitude_deg:+.6f}°E). "
+                f"Spacecraft geometry: {prediction.spacecraft_geometry}. "
                 f"3 dB beamwidth: {prediction.beamwidth_3db_deg:.6f}°. "
                 f"Closest alignment: {shortest:.6f}°. "
                 f"Longest window: {longest / 60.0:.2f} min. "
@@ -12821,7 +13162,15 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         else:
             self.sun_outage_summary.setText(
                 "No Sun-disc/3 dB-beam intersection was found for the selected "
-                "year, station, GEO slot and receiving-link parameters."
+                "year, station, GEO slot and receiving-link parameters. "
+                f"Spacecraft geometry: {prediction.spacecraft_geometry}."
+            )
+        model_warning = getattr(self, "_sun_outage_model_warning", None)
+        if model_warning:
+            self.sun_outage_summary.setText(
+                self.sun_outage_summary.text()
+                + " Orbit-data warning: "
+                + model_warning
             )
         self.statusBar().showMessage(
             f"Sun-outage calculation completed: {len(prediction.events)} windows",
@@ -12829,7 +13178,234 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
         )
 
 
+    def import_sun_outage_reference(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            self.tr("Import Sun Outage Reference Schedule"),
+            "",
+            "Sun Outage References (*.txt *.xlsx *.csv);;All Files (*)",
+            options=theme.file_dialog_options(),
+        )
+        if not paths:
+            return
+        try:
+            events = load_sun_outage_reference_files(paths)
+        except (OSError, ValueError, SunOutageReferenceError) as error:
+            self.sun_outage_reference_events = ()
+            self.sun_outage_reference_files = ()
+            self.sun_outage_reference_summary.setText(
+                "REFERENCE IMPORT ERROR\n" + str(error)
+            )
+            self.sun_outage_reference_table.setRowCount(0)
+            self.set_sun_outage_error_metrics()
+            return
+        identified = {event.satellite for event in events if event.satellite}
+        profile_satellite = sun_outage_satellite_code(
+            self.active_profile.display_name
+        )
+        if identified and profile_satellite not in identified:
+            expected = ", ".join(sorted(identified))
+            self.sun_outage_reference_events = ()
+            self.sun_outage_reference_files = ()
+            self.sun_outage_reference_summary.setText(
+                f"REFERENCE IMPORT ERROR\nFiles identify {expected}, but the active "
+                f"spacecraft is {self.active_profile.display_name}."
+            )
+            self.sun_outage_reference_table.setRowCount(0)
+            self.set_sun_outage_error_metrics()
+            return
+        self.sun_outage_reference_events = events
+        self.sun_outage_reference_files = tuple(Path(path).name for path in paths)
+        self.update_sun_outage_reference_comparison()
+
+
+    def load_default_sun_outage_references(self):
+        try:
+            events = load_bundled_sun_outage_references()
+        except (OSError, ValueError, SunOutageReferenceError) as error:
+            self.sun_outage_reference_events = ()
+            self.sun_outage_reference_files = ()
+            self.sun_outage_reference_summary.setText(
+                "BUNDLED REFERENCE ERROR\n" + str(error)
+            )
+            self.sun_outage_reference_table.setRowCount(0)
+            self.set_sun_outage_error_metrics()
+            return
+        self.sun_outage_reference_events = events
+        self.sun_outage_reference_files = tuple(
+            dict.fromkeys(event.source_name for event in events)
+        )
+        self.update_sun_outage_reference_comparison()
+
+
+    def update_sun_outage_reference_comparison(self):
+        table = getattr(self, "sun_outage_reference_table", None)
+        if table is None:
+            return
+        reference_events = tuple(getattr(self, "sun_outage_reference_events", ()))
+        if not reference_events:
+            table.setRowCount(0)
+            self.set_sun_outage_error_metrics()
+            return
+        station = getattr(self, "_sun_outage_station_by_key", {}).get(
+            self.sun_outage_station_combo.currentData()
+        )
+        station_identity = "" if station is None else (
+            f"{station.station_id} {station.name}".upper()
+        )
+        station_code = "BAK" if "BAK" in station_identity else (
+            "NAX" if "NAX" in station_identity else ""
+        )
+        prediction = self.sun_outage_prediction
+        selected_year = (
+            int(self.sun_outage_year.value())
+            if prediction is None
+            else int(prediction.year)
+        )
+        station_year_events = tuple(
+            event for event in reference_events
+            if (not station_code or event.station_code == station_code)
+            and event.start_utc.astimezone(timezone.utc).year == selected_year
+        )
+        identified = {
+            event.satellite for event in station_year_events if event.satellite
+        }
+        profile_satellite = sun_outage_satellite_code(
+            self.active_profile.display_name
+        )
+        matching_satellites = {
+            satellite for satellite in identified
+            if sun_outage_satellite_code(satellite) == profile_satellite
+        }
+        if identified and not matching_satellites:
+            table.setRowCount(0)
+            self.set_sun_outage_error_metrics()
+            self.sun_outage_reference_summary.setText(
+                "REFERENCE COMPARISON UNAVAILABLE\nThe imported schedule does not "
+                f"identify the active spacecraft {self.active_profile.display_name}."
+            )
+            return
+        filtered = tuple(
+            event for event in station_year_events
+            if event.satellite in matching_satellites
+            or (not identified and not event.satellite)
+        )
+        model_events = () if prediction is None else prediction.events
+        reference_by_date = {event.date_utc: event for event in filtered}
+        model_by_date = {
+            event.start_utc.astimezone(timezone.utc).date(): event
+            for event in model_events
+        }
+        dates = sorted(set(reference_by_date) | set(model_by_date))
+        table.setRowCount(len(dates))
+        matched = 0
+        missing = 0
+        extra = 0
+        pending = 0
+        matched_pairs = []
+        for row, day in enumerate(dates):
+            reference = reference_by_date.get(day)
+            model = model_by_date.get(day)
+            if reference is not None and model is not None:
+                matched += 1
+                start_delta = (model.start_utc - reference.start_utc).total_seconds()
+                end_delta = (model.end_utc - reference.end_utc).total_seconds()
+                center_delta = (
+                    model.peak_utc - reference.midpoint_utc
+                ).total_seconds()
+                reference_duration = (
+                    reference.end_utc - reference.start_utc
+                ).total_seconds()
+                duration_delta = (
+                    (model.end_utc - model.start_utc)
+                    - (reference.end_utc - reference.start_utc)
+                ).total_seconds()
+                duration_percent = 100.0 * duration_delta / reference_duration
+                matched_pairs.append((reference, model))
+                status = "MATCHED"
+            elif reference is not None and prediction is None:
+                pending += 1
+                start_delta = end_delta = center_delta = duration_delta = None
+                duration_percent = None
+                status = "AWAITING MODEL RUN"
+            elif reference is not None:
+                missing += 1
+                start_delta = end_delta = center_delta = duration_delta = None
+                duration_percent = None
+                status = "MISSING MODEL EVENT"
+            else:
+                extra += 1
+                start_delta = end_delta = center_delta = duration_delta = None
+                duration_percent = None
+                status = "EXTRA MODEL EVENT"
+            values = (
+                day.isoformat(),
+                (
+                    "—"
+                    if reference is None
+                    else reference.satellite or "UNIDENTIFIED"
+                ),
+                "—" if reference is None else self._sun_outage_time_text(reference.start_utc),
+                "—" if reference is None else self._sun_outage_time_text(reference.midpoint_utc),
+                "—" if reference is None else self._sun_outage_time_text(reference.end_utc),
+                "—" if reference is None else self._sun_outage_error_text(
+                    (reference.end_utc - reference.start_utc).total_seconds()
+                ),
+                "—" if model is None else self._sun_outage_time_text(model.start_utc),
+                "—" if model is None else self._sun_outage_time_text(model.peak_utc),
+                "—" if model is None else self._sun_outage_time_text(model.end_utc),
+                "—" if model is None else self._sun_outage_error_text(
+                    (model.end_utc - model.start_utc).total_seconds()
+                ),
+                self._sun_outage_error_text(center_delta, signed=True),
+                self._sun_outage_error_text(start_delta, signed=True),
+                self._sun_outage_error_text(end_delta, signed=True),
+                self._sun_outage_error_text(duration_delta, signed=True),
+                "—" if duration_percent is None else f"{duration_percent:+.1f} %",
+                status,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(row, column, item)
+        metrics = calculate_sun_outage_error_metrics(matched_pairs)
+        self.set_sun_outage_error_metrics(
+            metrics,
+            awaiting_model=prediction is None and bool(filtered),
+        )
+        files = ", ".join(getattr(self, "sun_outage_reference_files", ()))
+        source_satellites = []
+        for source_name in getattr(self, "sun_outage_reference_files", ()):
+            source_events = tuple(
+                event for event in reference_events
+                if event.source_name == source_name
+            )
+            source_ids = sorted({event.satellite for event in source_events if event.satellite})
+            if not source_ids:
+                identity = "UNIDENTIFIED"
+            else:
+                identity = "/".join(source_ids)
+                if source_events and all(event.satellite_inferred for event in source_events):
+                    identity += " (from companion source)"
+            source_satellites.append(f"{source_name} → {identity}")
+        source_map = "; ".join(source_satellites)
+        pending_text = f" · awaiting model {pending}" if pending else ""
+        self.sun_outage_reference_summary.setText(
+            f"Reference: {files} · {len(filtered)} station events · "
+            f"matched {matched} · missing {missing} · extra {extra}{pending_text}. "
+            f"Satellite sources: {source_map}. "
+            "CENTER compares the model peak with the source-window midpoint. "
+            "SOURCE LINK SETTINGS MISSING: these schedules contain no frequency, "
+            "antenna diameter, 3 dB beamwidth, link margin or event threshold, so "
+            "START/END/DURATION values are configuration differences, not a "
+            "like-for-like accuracy score. Differences are model − reference; "
+            "source UTC values remain unchanged and no fitted constant or "
+            "calibration is applied."
+        )
+
+
     def cancel_sun_outage_prediction(self):
+        self._sun_outage_accept_result = False
         if self.sun_outage_thread is None or not self.sun_outage_thread.isRunning():
             return
         self.sun_outage_thread.requestInterruption()
@@ -12838,6 +13414,8 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
 
 
     def fail_sun_outage_prediction(self, message):
+        if not getattr(self, "_sun_outage_accept_result", False):
+            return
         self.sun_outage_summary.setText("SUN OUTAGE ERROR\n" + str(message))
         self.sun_outage_progress.setFormat("Failed")
         self.sun_outage_calculate_button.setEnabled(True)
@@ -12846,6 +13424,8 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
 
 
     def cancelled_sun_outage_prediction(self):
+        if not getattr(self, "_sun_outage_accept_result", False):
+            return
         self.sun_outage_prediction = None
         self.sun_outage_summary.setText(
             "SUN OUTAGE SEARCH CANCELLED\nNo partial schedule was stored."
@@ -12859,6 +13439,11 @@ class MainWindow(ProductFeatureMixin, QMainWindow):
     def cleanup_sun_outage_prediction(self):
         self.sun_outage_worker = None
         self.sun_outage_thread = None
+        self.sun_outage_calculate_button.setEnabled(True)
+        self.sun_outage_cancel_button.setEnabled(False)
+        if not getattr(self, "_sun_outage_accept_result", False):
+            self.sun_outage_progress.setValue(0)
+            self.sun_outage_progress.setFormat("Cancelled")
 
 
     def export_sun_outage_csv(self):

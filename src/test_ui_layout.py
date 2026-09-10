@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication, QScrollArea
+from PyQt6.QtWidgets import QApplication, QLabel, QScrollArea
 
 from gui.main_window import (
     APP_ICON_PATH,
@@ -108,6 +108,52 @@ class ResponsiveLayoutTests(unittest.TestCase):
         self.assertFalse(self.window._graph_only_mode)
         self.assertTrue(self.window.hero_card.isVisible())
         self.assertTrue(self.window.graph_controls_host.isVisible())
+
+    def test_orbital_expand_fills_the_screen_with_only_the_graph(self):
+        self.window.resize(1366, 768)
+        self.window.tabs.setCurrentIndex(self.window.system_view_tab_index)
+        self.application.processEvents()
+
+        self.assertTrue(self.window.hero_card.isVisible())
+        self.assertTrue(self.window.tabs.tabBar().isVisible())
+        self.assertTrue(self.window.system_controls_host.isVisible())
+        self.assertIs(self.window.system_theater_button.parentWidget(), self.window.system_graph)
+
+        QTest.mouseClick(
+            self.window.system_theater_button,
+            Qt.MouseButton.LeftButton,
+        )
+        self.application.processEvents()
+
+        self.assertTrue(self.window._orbital_theater_mode)
+        self.assertTrue(self.window.isFullScreen())
+        self.assertFalse(self.window.hero_card.isVisible())
+        self.assertFalse(self.window.tabs.tabBar().isVisible())
+        self.assertFalse(self.window.module_tabs.tabBar().isVisible())
+        self.assertTrue(self.window.system_graph.isVisible())
+        self.assertFalse(self.window.system_controls_host.isVisible())
+        self.assertFalse(self.window.system_object_box.isVisible())
+        self.assertFalse(self.window.system_coordinates_box.isVisible())
+
+        QTest.keyClick(self.window, Qt.Key.Key_Escape)
+        self.application.processEvents()
+        self.assertFalse(self.window._orbital_theater_mode)
+        self.assertFalse(self.window.isFullScreen())
+        self.assertTrue(self.window.hero_card.isVisible())
+        self.assertTrue(self.window.tabs.tabBar().isVisible())
+        self.assertTrue(self.window.system_controls_host.isVisible())
+        self.assertTrue(self.window.system_object_box.isVisible())
+        self.assertTrue(self.window.system_coordinates_box.isVisible())
+
+    def test_geo_page_omits_redundant_analysis_only_banner(self):
+        banner = (
+            "ANALYSIS ONLY  ·  NO BURN IS APPLIED  ·  "
+            "NO SPACECRAFT COMMAND IS GENERATED"
+        )
+        visible_text = "\n".join(
+            label.text() for label in self.window.findChildren(QLabel)
+        )
+        self.assertNotIn(banner, visible_text)
 
     def test_settings_pages_are_scrollable_and_panel_is_not_fixed(self):
         self.window.resize(640, 360)

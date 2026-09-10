@@ -248,6 +248,20 @@ def get_satellite_position(
         Satellite position [km]
     """
 
+    return get_satellite_state(
+        satellite_name,
+        utc_time,
+        norad_id=norad_id,
+    )[:3]
+
+
+def get_satellite_state(
+    satellite_name,
+    utc_time,
+    norad_id=None,
+):
+    """Return the event-time Skyfield/SGP4 J2000 state in km and km/s."""
+
     satellite = load_satellite(
         satellite_name,
         norad_id=norad_id,
@@ -255,9 +269,13 @@ def get_satellite_position(
 
     t = skyfield_time_from_datetime(utc_time)
 
-    position = satellite.at(t).position.km
-
-    return position
+    geocentric = satellite.at(t)
+    return np.concatenate(
+        (
+            np.asarray(geocentric.position.km, dtype=float),
+            np.asarray(geocentric.velocity.km_per_s, dtype=float),
+        )
+    )
 
 
 def get_satellite_position_and_altitude(

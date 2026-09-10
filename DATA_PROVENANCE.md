@@ -24,6 +24,40 @@ direction is calculated from the bundled JPL DE440 kernel. Results identify
 the geometric intersection of the solar disc and the receiving antenna's 3 dB
 beam; they are not a carrier-specific link-budget outage guarantee.
 
+The protected initial receiving-link preset is 10.7 GHz with a 2.0 m antenna.
+It is an engineering starting point evaluated with the same ITU `70 λ/D`
+equation, not recovered metadata and not a fitted timing constant. Operators
+must explicitly unlock those controls and replace the values when authoritative
+link parameters are available.
+
+For TLE profiles, the application evaluates the Skyfield/SGP4 spacecraft
+position separately at every transit and contact-search epoch while its
+Earth-fixed longitude remains inside the active profile's configured station
+box. If long-arc TLE propagation leaves that physical control region, it retains
+the source-derived inclined/eccentric station-kept GEO motion instead. This
+avoids an invented time-validity constant, but neither mode can reproduce
+unreported station-keeping manoeuvres. A local historical TLE or authoritative
+event-date ephemeris is therefore required for validation-grade comparisons
+across separated seasons.
+
+When the active profile contains a valid J2000 Cartesian state, Sun-outage
+geometry derives the spacecraft's osculating orbital plane, eccentricity and
+phase from that state. It repeats that state-derived daily figure at the
+physical sidereal rate, which represents a station-kept geosynchronous
+spacecraft without extrapolating an unobserved longitude drift. The nominal
+slot supplies only the independently configured longitude anchor. If no valid
+GEO state is available, the application labels and uses the older fixed-slot
+fallback. The operator Sun-outage schedule is never used to estimate these
+orbit quantities.
+
+The bundled 2026 operator schedules preserve the supplied start/end UTC values,
+but their files do not identify the receiving frequency, antenna diameter,
+beamwidth, link margin, event threshold, or full event-date spacecraft
+ephemeris.  Consequently the application reports their window midpoint against
+the model's geometric peak separately.  Start, end, and duration values are raw
+configuration differences until matching source link metadata is supplied; no
+reference-derived constant or calibration is applied.
+
 ## Assets
 
 The public mark `assets/opa_public_mark.svg` and Retro control SVGs are original repository-native geometry. The application owner selected the established generic OPA emblem and mission-banner raster artwork for the product identity; these files contain no operator name or embedded text metadata. Their original authorship and redistribution grant have not yet been independently verified, so they remain part of the manual ownership/licensing gate below.

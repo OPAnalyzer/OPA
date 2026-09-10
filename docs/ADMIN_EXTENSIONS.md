@@ -13,6 +13,18 @@ Admin extensions are optional data-only additions to the public application. The
 
 Signature verification happens before DPAPI unprotect and decryption. Re-enrolling creates a new device identity and invalidates packages created for the previous enrollment.
 
+## Shared team package
+
+For an authorized colleague who must not send a device descriptor back to the
+provisioner, create a shared package with
+`scripts/build_shared_admin_package.py`. The colleague first enrolls using the
+same public verification key, then selects the resulting `.opa-admin` package
+in Settings → Admin Access and enters its password. The shared package can be
+opened by any enrolled Windows user/device with that verification key and the
+password, so distribute it only to the intended team. It remains signed and
+authenticated before its data is loaded. The private signing key stays on the
+provisioning computer.
+
 The standard enrollment and encrypted package live under the operating system's per-user application-data directory, never under the source/application folder. Zipping or copying the repository therefore does not include private content. The UI does not display or persist those external paths.
 
 ## External-only secrets

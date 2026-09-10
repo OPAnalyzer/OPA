@@ -44,9 +44,11 @@ from satellite_profiles import SatelliteProfile, validate_profile
 
 
 PACKAGE_SCHEMA = "opa-admin-package/v1"
+SHARED_PACKAGE_DEVICE_ID = "shared-team-access"
 CONTENT_SCHEMA = "opa-admin-content/v2"
 ENROLLMENT_SCHEMA = "opa-admin-enrollment/v1"
 PACKAGE_VERSION = 1
+SHARED_PACKAGE_VERSION = 2
 MAX_PACKAGE_BYTES = 32 * 1024 * 1024
 MAX_PROFILES = 64
 MAX_REFERENCE_DATASETS = 32
@@ -748,6 +750,30 @@ def _derive_key(password: str, device_secret: bytes, salt: bytes) -> bytearray:
         combined[:] = b"\x00" * len(combined)
 
 
+def _derive_shared_key(password: str, salt: bytes) -> bytearray:
+    """Derive a key for a signed shared package without a device secret."""
+
+    if not isinstance(password, str) or not password:
+        raise AdminSecurityError("Admin password is required.")
+    if len(password) > 4096:
+        raise AdminSecurityError("Admin password is invalid.")
+    encoded = bytearray(password.encode("utf-8"))
+    try:
+        return bytearray(
+            hash_secret_raw(
+                secret=bytes(encoded),
+                salt=salt,
+                time_cost=KDF_TIME_COST,
+                memory_cost=KDF_MEMORY_COST_KIB,
+                parallelism=KDF_PARALLELISM,
+                hash_len=32,
+                type=Type.ID,
+            )
+        )
+    finally:
+        encoded[:] = b"\x00" * len(encoded)
+
+
 def _signature_payload(envelope: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in envelope.items() if key != "signature"}
 
@@ -794,6 +820,72 @@ def build_signed_package(
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "kdf": {
             "name": "argon2id",
+            "salt": _b64encode(salt),
+            "time_cost": KDF_TIME_COST,
+            "memory_cost_kib": KDF_MEMORY_COST_KIB,
+            "parallelism": KDF_PARALLELISM,
+        },
+        "aead": {
+            "name": "AES-256-GCM",
+            "nonce": _b64encode(nonce),
+            "ciphertext": _b64encode(ciphertext),
+        },
+    }
+    envelope["signature"] = _b64encode(signing_key.sign(_canonical_json(envelope)))
+    return _canonical_json(envelope) + b"\n"
+
+
+def build_shared_access_package(
+    content: Mapping[str, Any],
+    password: str,
+    verification_key: bytes,
+    signing_key: Ed25519PrivateKey,
+) -> bytes:
+    """Build a signed password-protected package for enrolled team devices.
+
+    A shared package deliberately trades per-device exclusivity for offline
+    distribution: any computer enrolled with this verification key and given
+    the password can open it. The signature still binds the content to the
+    holder of the private signing key.
+    """
+
+    validate_admin_content(content)
+    verification_key = bytes(verification_key)
+    if len(verification_key) != 32:
+        raise AdminSecurityError("The Ed25519 verification key must be 32 bytes.")
+    Ed25519PublicKey.from_public_bytes(verification_key)
+    signing_public_key = signing_key.public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+    if signing_public_key != verification_key:
+        raise AdminSecurityError(
+            "The signing key does not match the shared package verification key."
+        )
+    salt = secrets.token_bytes(KDF_SALT_BYTES)
+    nonce = secrets.token_bytes(NONCE_BYTES)
+    key = _derive_shared_key(password, salt)
+    plaintext = bytearray(_canonical_json(content))
+    aad = _canonical_json(
+        {
+            "schema": PACKAGE_SCHEMA,
+            "package_version": SHARED_PACKAGE_VERSION,
+            "device_id": SHARED_PACKAGE_DEVICE_ID,
+            "key_id": _key_id(verification_key),
+        }
+    )
+    try:
+        ciphertext = AESGCM(bytes(key)).encrypt(nonce, bytes(plaintext), aad)
+    finally:
+        key[:] = b"\x00" * len(key)
+        plaintext[:] = b"\x00" * len(plaintext)
+    envelope = {
+        "schema": PACKAGE_SCHEMA,
+        "package_version": SHARED_PACKAGE_VERSION,
+        "device_id": SHARED_PACKAGE_DEVICE_ID,
+        "key_id": _key_id(verification_key),
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "kdf": {
+            "name": "argon2id-password",
             "salt": _b64encode(salt),
             "time_cost": KDF_TIME_COST,
             "memory_cost_kib": KDF_MEMORY_COST_KIB,
@@ -874,10 +966,19 @@ class AdminSessionManager:
                     "kdf", "aead", "signature",
                 },
             )
-            if envelope["schema"] != PACKAGE_SCHEMA or envelope["package_version"] != PACKAGE_VERSION:
+            package_version = envelope["package_version"]
+            if (
+                envelope["schema"] != PACKAGE_SCHEMA
+                or package_version not in {PACKAGE_VERSION, SHARED_PACKAGE_VERSION}
+            ):
                 raise AdminSecurityError("Admin package version is unsupported.")
             enrollment = load_enrollment(self.enrollment_path)
-            if envelope["device_id"] != enrollment.device_id or envelope["key_id"] != enrollment.key_id:
+            shared_package = package_version == SHARED_PACKAGE_VERSION
+            if shared_package and envelope["device_id"] != SHARED_PACKAGE_DEVICE_ID:
+                raise AdminSecurityError("Shared admin package identity is invalid.")
+            if envelope["key_id"] != enrollment.key_id or (
+                not shared_package and envelope["device_id"] != enrollment.device_id
+            ):
                 raise AdminSecurityError("This package is not authorized for this device.")
             signature = _b64decode(envelope["signature"], "package signature", 64)
             try:
@@ -893,7 +994,9 @@ class AdminSessionManager:
             _require_keys(kdf, {"name", "salt", "time_cost", "memory_cost_kib", "parallelism"})
             _require_keys(aead, {"name", "nonce", "ciphertext"})
             if (
-                kdf["name"] != "argon2id"
+                kdf["name"] != (
+                    "argon2id-password" if shared_package else "argon2id"
+                )
                 or kdf["time_cost"] != KDF_TIME_COST
                 or kdf["memory_cost_kib"] != KDF_MEMORY_COST_KIB
                 or kdf["parallelism"] != KDF_PARALLELISM
@@ -903,20 +1006,27 @@ class AdminSessionManager:
             salt = _b64decode(kdf["salt"], "KDF salt", KDF_SALT_BYTES)
             nonce = _b64decode(aead["nonce"], "AEAD nonce", NONCE_BYTES)
             ciphertext = _b64decode(aead["ciphertext"], "ciphertext")
-            device_secret = bytearray(
-                self.protector.unprotect(enrollment.protected_device_secret)
-            )
-            try:
-                if len(device_secret) != DEVICE_SECRET_BYTES:
-                    raise AdminSecurityError("Device enrollment is invalid.")
-                key = _derive_key(password, bytes(device_secret), salt)
-            finally:
-                device_secret[:] = b"\x00" * len(device_secret)
+            if shared_package:
+                key = _derive_shared_key(password, salt)
+            else:
+                device_secret = bytearray(
+                    self.protector.unprotect(enrollment.protected_device_secret)
+                )
+                try:
+                    if len(device_secret) != DEVICE_SECRET_BYTES:
+                        raise AdminSecurityError("Device enrollment is invalid.")
+                    key = _derive_key(password, bytes(device_secret), salt)
+                finally:
+                    device_secret[:] = b"\x00" * len(device_secret)
             aad = _canonical_json(
                 {
                     "schema": PACKAGE_SCHEMA,
-                    "package_version": PACKAGE_VERSION,
-                    "device_id": enrollment.device_id,
+                    "package_version": package_version,
+                    "device_id": (
+                        SHARED_PACKAGE_DEVICE_ID
+                        if shared_package
+                        else enrollment.device_id
+                    ),
                     "key_id": enrollment.key_id,
                 }
             )

@@ -1356,14 +1356,6 @@ class ProductFeatureMixin:
         description.setObjectName("metricDetail")
         layout.addWidget(description)
 
-        safety = QLabel(
-            "ANALYSIS ONLY  ·  NO BURN IS APPLIED  ·  NO SPACECRAFT COMMAND IS GENERATED"
-        )
-        safety.setWordWrap(True)
-        safety.setStyleSheet(theme.status_style("warning", padding=8))
-        self.geo_safety_notice = safety
-        layout.addWidget(safety)
-
         controls_box = QGroupBox("ACTIVE PROJECT CONSTRAINTS")
         form = QGridLayout(controls_box)
         form.setHorizontalSpacing(12)
@@ -1713,9 +1705,6 @@ class ProductFeatureMixin:
     def refresh_geo_theme(self):
         if not hasattr(self, "geo_chart"):
             return
-        self.geo_safety_notice.setStyleSheet(
-            theme.status_style("warning", padding=8)
-        )
         if self.latest_geo_analysis is None:
             if self.geo_status_value.text() == "INSUFFICIENT DATA":
                 self.geo_status_value.setStyleSheet(
